@@ -1,0 +1,5 @@
+openapi: 3.0.3
+info:
+  title: Tasks API
+  version: 0.3.3
+paths: {}

@@ -1,54 +1,37 @@
 from datetime import datetime, timezone
-from typing import List, Optional, Dict
-from uuid import UUID, uuid4
-from fastapi import FastAPI, HTTPException, status, Response
-from pydantic import BaseModel, Field
+from typing import Optional
+from uuid import UUID
 
-class Task(BaseModel):
-    id: UUID
-    title: str = Field(min_length=1, max_length=200)
-    description: Optional[str] = Field(default=None, max_length=2000)
-    status: str = Field(default="open", pattern="^(open|doing|done)$")
-    priority: str = Field(default="normal", pattern="^(low|normal|high)$")
-    dueAt: Optional[datetime] = None
-    tags: List[str] = []
-    createdAt: datetime
-    updatedAt: datetime
+from fastapi import FastAPI, HTTPException, status, Response, Depends
+from sqlalchemy.orm import Session
 
-class TaskCreate(BaseModel):
-    title: str = Field(min_length=1, max_length=200)
-    description: Optional[str] = Field(default=None, max_length=2000)
-    priority: Optional[str] = Field(default="normal", pattern="^(low|normal|high)$")
-    dueAt: Optional[datetime] = None
-    tags: Optional[List[str]] = None
-
-class TaskUpdate(BaseModel):
-    title: Optional[str] = Field(default=None, min_length=1, max_length=200)
-    description: Optional[str] = Field(default=None, max_length=2000)
-    status: Optional[str] = Field(default=None, pattern="^(open|doing|done)$")
-    priority: Optional[str] = Field(default=None, pattern="^(low|normal|high)$")
-    dueAt: Optional[datetime] = None
-    tags: Optional[List[str]] = None
-
-class TaskListResponse(BaseModel):
-    items: List[Task]
-    page: int
-    size: int
-    total: int
+from .db import get_session
+from . import models, schemas
 
 app = FastAPI(
     title="Tasks API",
-    version="0.2.0",
-    description="Step 2: In-Memory CRUD für Tasks",
+    version="0.3.3",
+    description="Step 3 (fixed3): PostgreSQL Persistenz",
     openapi_url="/openapi.json",
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
-_TASKS: Dict[UUID, Task] = {}
-
-def now_utc() -> datetime:
+def now_utc():
     return datetime.now(timezone.utc)
+
+def to_schema(task: models.Task) -> schemas.Task:
+    return schemas.Task(
+        id=task.id,
+        title=task.title,
+        description=task.description,
+        status=task.status.value if hasattr(task.status, "value") else task.status,
+        priority=task.priority.value if hasattr(task.priority, "value") else task.priority,
+        dueAt=task.due_at,
+        tags=task.tags or [],
+        createdAt=task.created_at,
+        updatedAt=task.updated_at,
+    )
 
 def problem(status_code: int, title: str, detail: Optional[str] = None) -> HTTPException:
     return HTTPException(status_code=status_code, detail={
@@ -62,60 +45,69 @@ def problem(status_code: int, title: str, detail: Optional[str] = None) -> HTTPE
 async def health():
     return {"status": "ok", "time": now_utc().isoformat()}
 
-@app.get("/api/v1/tasks", response_model=TaskListResponse, tags=["tasks"])
-async def list_tasks(page: int = 1, size: int = 20, q: Optional[str] = None):
+@app.get("/api/v1/tasks", response_model=schemas.TaskListResponse, tags=["tasks"])
+def list_tasks(page: int = 1, size: int = 20, q: Optional[str] = None, db: Session = Depends(get_session)):
     if page < 1 or size < 1 or size > 100:
         raise problem(status.HTTP_400_BAD_REQUEST, "Bad Request", "Invalid pagination parameters")
-    tasks = list(_TASKS.values())
+    query = db.query(models.Task)
     if q:
-        q_lower = q.lower()
-        tasks = [t for t in tasks if q_lower in t.title.lower() or (t.description and q_lower in t.description.lower())]
-    total = len(tasks)
-    start = (page - 1) * size
-    end = start + size
-    return TaskListResponse(items=tasks[start:end], page=page, size=size, total=total)
+        ilike = f"%{q}%"
+        query = query.filter((models.Task.title.ilike(ilike)) | (models.Task.description.ilike(ilike)))
+    total = query.count()
+    items = (query
+             .order_by(models.Task.created_at.desc())
+             .offset((page - 1) * size)
+             .limit(size)
+             .all())
+    return schemas.TaskListResponse(
+        items=[to_schema(t) for t in items],
+        page=page, size=size, total=total
+    )
 
-@app.post("/api/v1/tasks", response_model=Task, status_code=status.HTTP_201_CREATED, tags=["tasks"])
-async def create_task(payload: TaskCreate, response: Response):
-    t = Task(
-        id=uuid4(),
+@app.post("/api/v1/tasks", response_model=schemas.Task, status_code=status.HTTP_201_CREATED, tags=["tasks"])
+def create_task(payload: schemas.TaskCreate, response: Response, db: Session = Depends(get_session)):
+    t = models.Task(
         title=payload.title,
         description=payload.description,
-        status="open",
-        priority=payload.priority or "normal",
-        dueAt=payload.dueAt,
+        status=models.StatusEnum.open,
+        priority=models.PriorityEnum(payload.priority) if payload.priority else models.PriorityEnum.normal,
+        due_at=payload.dueAt,
         tags=payload.tags or [],
-        createdAt=now_utc(),
-        updatedAt=now_utc(),
     )
-    _TASKS[t.id] = t
+    db.add(t)
+    db.commit()
+    db.refresh(t)
     response.headers["Location"] = f"/api/v1/tasks/{t.id}"
-    return t
+    return to_schema(t)
 
-@app.get("/api/v1/tasks/{id}", response_model=Task, tags=["tasks"])
-async def get_task(id: UUID):
-    t = _TASKS.get(id)
+@app.get("/api/v1/tasks/{id}", response_model=schemas.Task, tags=["tasks"])
+def get_task(id: UUID, db: Session = Depends(get_session)):
+    t = db.get(models.Task, id)
     if not t:
         raise problem(status.HTTP_404_NOT_FOUND, "Not Found", "Task not found")
-    return t
+    return to_schema(t)
 
-@app.patch("/api/v1/tasks/{id}", response_model=Task, tags=["tasks"])
-async def update_task(id: UUID, payload: TaskUpdate):
-    t = _TASKS.get(id)
+@app.patch("/api/v1/tasks/{id}", response_model=schemas.Task, tags=["tasks"])
+def update_task(id: UUID, payload: schemas.TaskUpdate, db: Session = Depends(get_session)):
+    t = db.get(models.Task, id)
     if not t:
         raise problem(status.HTTP_404_NOT_FOUND, "Not Found", "Task not found")
-    data = t.dict()
-    updates = payload.dict(exclude_unset=True)
-    for k, v in updates.items():
-        data[k] = v
-    data["updatedAt"] = now_utc()
-    t2 = Task(**data)
-    _TASKS[id] = t2
-    return t2
+    data = payload.dict(exclude_unset=True)
+    if "title" in data: t.title = data["title"]
+    if "description" in data: t.description = data["description"]
+    if "status" in data and data["status"] is not None: t.status = models.StatusEnum(data["status"])
+    if "priority" in data and data["priority"] is not None: t.priority = models.PriorityEnum(data["priority"])
+    if "dueAt" in data: t.due_at = data["dueAt"]
+    if "tags" in data and data["tags"] is not None: t.tags = data["tags"]
+    db.commit()
+    db.refresh(t)
+    return to_schema(t)
 
 @app.delete("/api/v1/tasks/{id}", status_code=status.HTTP_204_NO_CONTENT, tags=["tasks"])
-async def delete_task(id: UUID):
-    if id not in _TASKS:
+def delete_task(id: UUID, db: Session = Depends(get_session)):
+    t = db.get(models.Task, id)
+    if not t:
         raise problem(status.HTTP_404_NOT_FOUND, "Not Found", "Task not found")
-    _TASKS.pop(id, None)
+    db.delete(t)
+    db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
