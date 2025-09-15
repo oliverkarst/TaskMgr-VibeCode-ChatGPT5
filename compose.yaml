@@ -16,7 +16,9 @@ services:
       - pgdata:/var/lib/postgresql/data
 
   api:
-    build: ./api
+    build:
+      context: ./api
+      dockerfile: Dockerfile
     environment:
       LOG_LEVEL: info
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://tasks:tasks@db:5432/tasksdb}
@@ -28,7 +30,26 @@ services:
       - "8080:8080"
     command: ["/bin/sh", "-c", "./entrypoint.sh"]
     volumes:
+      # optional: Spezifikationen schreibgeschützt mounten, falls vorhanden
       - ./docs/specs:/app/docs/specs:ro
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile.dev
+    working_dir: /usr/src/app
+    command: >
+      sh -c "npm ci &&
+             npm run start -- --host 0.0.0.0 --port 4200 --proxy-config proxy.conf.json"
+    environment:
+      CHOKIDAR_USEPOLLING: "true"
+    ports:
+      - "4200:4200"
+    volumes:
+      - ./ui:/usr/src/app
+      - /usr/src/app/node_modules
+    depends_on:
+      - api
 
 volumes:
   pgdata:
